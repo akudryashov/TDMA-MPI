@@ -24,6 +24,9 @@ void TDMA(double* a, double* b, double* c, double* d, double* array, int N, boun
 //support functions
 double f(double x)
 {
+    if (x == 0) {
+        return -5;
+    }
     return x*x*x*x/20000 + sin(x);
 }
 double spline(double v, double* x, double* y, double* u)
@@ -84,18 +87,23 @@ int main(int argc, const char * argv[])
     double* y = new double[m + 1];
     double* h = new double[m + 1];
     for (int i=0; i <= m; i++) {
-        x[i] = 2*i + rank*m;
-        double differ = i > 0 && i < m ? arc4random()%2 : 0;
-        y[i] = f(x[i]);
+        x[i] = i + rank*m;
+        double v = x[i];
+        if (rank == size - 1 && i == m) {
+            v = 0;
+        }
+        y[i] = f(v);
     }
     for (int i=1; i <= m; i++) {
         h[i] = x[i] - x[i-1];
     }
     
     boundValue leftBound0;
-    leftBound0.type = boundsNormal;
-    leftBound0.k = -0.5;
-    leftBound0.r = 3.*((y[1]-y[0])/h[1] - L)/h[1];
+    //    leftBound0.type = boundsNormal;
+    //    leftBound0.k = -0.5;
+    //    leftBound0.r = 3.*((y[1]-y[0])/h[1] - L)/h[1];
+    
+    leftBound0.type = boundsCyclic;
     
     boundsConditions bounds0;
     bounds0.left = leftBound0;
@@ -124,13 +132,21 @@ int main(int argc, const char * argv[])
             y_prev = cache[3];
             h_prev = cache[4];
         }
+        if (leftBound0.type == boundsCyclic) {
+            A0[0] = h_prev/6.;
+            C0[0] = (h_prev + h[1])/3.;
+            B0[0] = h[1]/6.;
+            D0[0] = (y[1] - y[0])/h[1] - (y[0] - y_prev)/h_prev;
+        }
         double Rbuf;
         MPI_Status status;
         MPI_Recv(&Rbuf, 1, MPI_DOUBLE, size - 1, 201, MPI_COMM_WORLD, &status);
         boundValue rightBound0;
-        rightBound0.type = boundsNormal;
-        rightBound0.k = -0.5;
-        rightBound0.r = Rbuf;
+        //        rightBound0.type = boundsNormal;
+        //        rightBound0.k = -0.5;
+        //        rightBound0.r = Rbuf;
+        
+        rightBound0.type = boundsCyclic;
         
         bounds0.right = rightBound0;
     }
@@ -146,6 +162,7 @@ int main(int argc, const char * argv[])
             MPI_Send(&Rbuf, 1, MPI_DOUBLE, 0, 201, MPI_COMM_WORLD);
         }
     }
+    
     // waiting for all processors
     MPI_Barrier(MPI_COMM_WORLD);
     
@@ -270,7 +287,7 @@ void TDMAParallel(double* a, double* b, double* c, double* d, double* array, int
     else {
         boundsConditions boundsZ;
         boundValue leftZbound;
-        leftZbound.type = boundsNormal;
+        leftZbound.type = bounds0.left.type;
         leftZbound.k = bounds0.left.k*v_1/(1. - bounds0.left.k*u_1);
         leftZbound.r = (bounds0.left.r + bounds0.left.k*w_1)/(1. - bounds0.left.k*u_1);
         boundsZ.left = leftZbound;
@@ -289,8 +306,15 @@ void TDMAParallel(double* a, double* b, double* c, double* d, double* array, int
             v_Nm = buff[3];
             w_Nm = buff[5];
         }
+        if (bounds0.right.type == boundsCyclic || bounds0.left.type == boundsCyclic) {
+            // in Nm last values from last processor
+            A[0] = a_0[0]*u_Nm;
+            C[0] = a_0[0]*v_Nm + c_0[0] + b_0[0]*u[1];
+            B[0] = b_0[0]*v[1];
+            D[0] = d_0[0] - a_0[0]*w_Nm - b_0[0]*w[1];
+        }
         boundValue rightZbound;
-        rightZbound.type = boundsNormal;
+        rightZbound.type = bounds0.right.type;
         rightZbound.k = bounds0.right.k*u_Nm/(1. - bounds0.right.k*v_Nm);
         rightZbound.r = (bounds0.right.r + bounds0.right.k*w_Nm)/(1. - bounds0.right.k*v_Nm);
         boundsZ.right = rightZbound;
@@ -320,17 +344,15 @@ void TDMAParallel(double* a, double* b, double* c, double* d, double* array, int
     delete [] w;
 }
 
-//a + c + b = d. simple method for each processor execution 
+void TDMA_cyclic(double* a, double* b, double* c, double* d, double* array, int N);
+
+//a + c + b = d. simple method for each processor execution
 void TDMA(double* a, double* b, double* c, double* d, double* array, int N, boundsConditions bounds)
 {
     if (bounds.right.type == boundsCyclic || bounds.left.type == boundsCyclic) {
-        if (bounds.right.type != bounds.left.type) {
-            printf("Cyclic must be both bounds");
-        }
-        //TODO
-        return ;//TDMACyclic(a, b, c, d, out);
+        TDMA_cyclic(a, b, c, d, array, N);
+        return;
     }
-    
     double* alp = new double[N];
     double* beta = new double[N];
     
@@ -350,4 +372,47 @@ void TDMA(double* a, double* b, double* c, double* d, double* array, int N, boun
     
     delete [] alp;
     delete [] beta;
+}
+
+// a + c + b = d
+// u = v + u0 * w
+// v = alp v(+) + beta
+// w = alp w(+) + gamma
+void TDMA_cyclic(double* a, double* b, double* c, double* d, double* array, int N)
+{
+    double* w = new double[N];
+    double* v = new double[N];
+    
+    double* alp = new double[N];
+    double* beta = new double[N];
+    double* gamma = new double[N];
+    
+    alp[1] = 0;
+    beta[1] = 0;
+    gamma[1] = 1;
+    
+    v[N-1] = 0;
+    w[N-1] = 1;
+    
+    for(int i = 1; i < N - 1; ++i) {
+        double ratio = (c[i] + a[i]*alp[i]);
+        alp[i+1] = -b[i]/ratio;
+        beta[i+1]= (d[i]-a[i]*beta[i])/ratio;
+        gamma[i+1] = -a[i]*gamma[i]/ratio;
+    }
+    
+    for(int i = N-1; i > 0; --i) {
+        v[i-1] = alp[i]*v[i] + beta[i];
+        w[i-1] = alp[i]*w[i] + gamma[i];
+    }
+    const double u0 = (d[0] - a[0]*v[N - 2] - b[0]*v[1])/(a[0]*w[N - 2] + c[0] + b[0]*w[1]);
+    for (int i = 0; i < N; ++i) {
+        array[i] = v[i] + u0 * w[i];
+    }
+    
+    delete [] alp;
+    delete [] beta;
+    delete [] gamma;
+    delete [] v;
+    delete [] w;
 }
